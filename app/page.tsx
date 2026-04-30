@@ -13,16 +13,69 @@ const MODES: { id: SummaryMode; label: string }[] = [
   { id: 'tldr',     label: 'TL;DR only' },
 ]
 
+// Runs in the BROWSER - YouTube does not block real browser requests
+async function fetchYouTubeTranscript(videoId: string) {
+  const clients = [
+    { clientName: 'WEB', clientVersion: '2.20210721.00.00' },
+    { clientName: 'ANDROID', clientVersion: '19.09.37', androidSdkVersion: 30 },
+    { clientName: 'TVHTML5', clientVersion: '7.20210224.00.00' },
+  ]
+
+  for (const clientConfig of clients) {
+    try {
+      const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          context: { client: { ...clientConfig, hl: 'en', gl: 'US' } },
+          videoId,
+        }),
+      })
+      if (!res.ok) continue
+
+      const data = await res.json()
+      const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+      const title: string = data?.videoDetails?.title || `Video ${videoId}`
+
+      if (!tracks?.length) continue
+
+      const track =
+        tracks.find((t: any) => t.languageCode?.startsWith('en') && !t.kind) ||
+        tracks.find((t: any) => t.languageCode?.startsWith('en')) ||
+        tracks.find((t: any) => !t.kind) ||
+        tracks[0]
+
+      const captionRes = await fetch(track.baseUrl + '&fmt=json3')
+      if (!captionRes.ok) continue
+
+      const captionData = await captionRes.json()
+      const transcript: string = (captionData.events || [])
+        .filter((e: any) => e.segs)
+        .flatMap((e: any) => e.segs.map((s: any) => s.utf8 as string))
+        .join(' ')
+        .replace(/\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+      if (transcript.length > 50) {
+        return { transcript, title, wordCount: transcript.split(/\s+/).length }
+      }
+    } catch { continue }
+  }
+
+  throw new Error('No captions found. Try a video with CC subtitles enabled on YouTube.')
+}
+
 export default function Home() {
-  const [url, setUrl]         = useState('')
-  const [mode, setMode]       = useState<SummaryMode>('bullets')
-  const [status, setStatus]   = useState<Status>('idle')
+  const [url, setUrl]           = useState('')
+  const [mode, setMode]         = useState<SummaryMode>('bullets')
+  const [status, setStatus]     = useState<Status>('idle')
   const [statusMsg, setStatusMsg] = useState('')
-  const [error, setError]     = useState('')
-  const [result, setResult]   = useState<SummaryResult | null>(null)
+  const [error, setError]       = useState('')
+  const [result, setResult]     = useState<SummaryResult | null>(null)
   const [videoMeta, setVideoMeta] = useState({ title: '', wordCount: 0, videoId: '' })
-  const [quizTab, setQuizTab] = useState(false)
-  const [answers, setAnswers] = useState<Record<number, number>>({})
+  const [quizTab, setQuizTab]   = useState(false)
+  const [answers, setAnswers]   = useState<Record<number, number>>({})
   const inputRef = useRef<HTMLInputElement>(null)
 
   const reset = () => {
@@ -40,30 +93,31 @@ export default function Home() {
     setStatusMsg('fetching transcript from YouTube...')
 
     try {
-      const transcriptRes = await fetch(`/api/transcript?url=${encodeURIComponent(url)}`)
-      const transcriptData = await transcriptRes.json()
-      if (!transcriptRes.ok) { setStatus('error'); setError(transcriptData.error); return }
+      // Step 1: fetch transcript in the browser (not blocked by YouTube)
+      const { transcript, title, wordCount } = await fetchYouTubeTranscript(videoId)
 
-      const { transcript, wordCount } = transcriptData
-      const title = url // server returns title via youtube-transcript; use URL for now
-
+      // Step 2: send to server only for Claude summarization
       setStatus('summarizing')
       setStatusMsg('summarizing with Claude AI...')
 
       const summaryRes = await fetch('/api/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript, title: `Video ${videoId}`, mode, wordCount }),
+        body: JSON.stringify({ transcript, title, mode, wordCount }),
       })
       const summaryData = await summaryRes.json()
-      if (!summaryRes.ok) { setStatus('error'); setError(summaryData.error || 'Summarization failed'); return }
+      if (!summaryRes.ok) {
+        setStatus('error')
+        setError(summaryData.error || 'Summarization failed')
+        return
+      }
 
-      setVideoMeta({ title: `Video: ${videoId}`, wordCount, videoId })
+      setVideoMeta({ title, wordCount, videoId })
       setResult(summaryData)
       setStatus('done')
-    } catch {
+    } catch (err: unknown) {
       setStatus('error')
-      setError('Something went wrong. Please try again.')
+      setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     }
   }
 
